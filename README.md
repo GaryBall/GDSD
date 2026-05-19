@@ -59,17 +59,8 @@ according to the local CUDA/PyTorch environment.
 Run from the root of this archive.
 
 ```bash
-bash scripts/run_gdsd_llada_sudoku.sh 1
-```
-
-```bash
-bash scripts/run_gdsd_tlc_dream_countdown.sh 1
-```
-
-GSM8K and Math scripts based on the internal large-run settings are provided in
-sanitized local form:
-
-```bash
+bash scripts/run_gdsd_llada_sudoku.sh 8
+bash scripts/run_gdsd_tlc_dream_countdown.sh 8
 bash scripts/run_gdsd_llada_gsm8k.sh 8
 bash scripts/run_gdsd_llada_math.sh 8
 bash scripts/run_spg_llada_gsm8k.sh 8
