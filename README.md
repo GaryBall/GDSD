@@ -46,8 +46,8 @@ dataset/
 ## Installation
 
 ```bash
-conda create -n gdsd-supplement python=3.10 -y
-conda activate gdsd-supplement
+conda create -n gdsd python=3.10 -y
+conda activate gdsd
 pip install -r requirements.txt
 ```
 
