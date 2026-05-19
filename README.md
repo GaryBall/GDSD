@@ -12,7 +12,7 @@ gdsd/
   rewards.py                       # task reward functions
   trainers/
     gdsd_trainer_batchll.py        # GDSD objective
-    gdsd_trainer_tlc.py            # GDSD-TLC variant
+    gdsd_trainer_tlc.py            # GDSD with token logits centralization
     espo_trainer.py                # ESPO baseline trainer
     spg_trainer.py                 # SPG baseline trainer
   utils/
