@@ -1,0 +1,64 @@
+# Model arguments
+model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+torch_dtype: bfloat16
+trust_remote_code: true
+
+use_peft: true
+lora_r: 128
+lora_alpha: 64
+lora_dropout: 0.05
+peft_task_type: CAUSAL_LM
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"]
+
+# GDSD / GRPO trainer config
+rl_loss_type: gdsd
+sync_ref_model: true
+ref_model_sync_steps: 64
+beta: 0.001
+epsilon: 0.0004
+scale_rewards: false
+bf16: true
+use_vllm: false
+do_eval: false
+num_generations: 6
+num_iterations: 8
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 12
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+learning_rate: 3.0e-06
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.01
+max_grad_norm: 0.2
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: constant_with_warmup
+num_train_epochs: 1
+output_dir: outputs/gdsd_run/checkpoints
+overwrite_output_dir: true
+
+# Diffusion generation config
+max_prompt_length: 400
+max_completion_length: 256
+random_masking: true
+diffusion_steps: 64
+generation_batch_size: 6
+generation_temperature: 1.0
+num_mc: 1
+reduce_var: false
+psi: 1.0
+
+report_to:
+- none
+save_strategy: "steps"
+save_steps: 500
+save_total_limit: 5
+seed: 42
+warmup_ratio: 0.001
