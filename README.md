@@ -59,19 +59,19 @@ according to the local CUDA/PyTorch environment.
 Run from the root of this archive.
 
 ```bash
-bash scripts/run_gdsd_llada_sudoku.sh 8
-bash scripts/run_gdsd_tlc_dream_countdown.sh 8
-bash scripts/run_gdsd_llada_gsm8k.sh 8
-bash scripts/run_gdsd_llada_math.sh 8
-bash scripts/run_spg_llada_gsm8k.sh 8
-bash scripts/run_espo_llada_math.sh 8
+bash scripts/run_gdsd_llada_sudoku.sh
+bash scripts/run_gdsd_tlc_dream_countdown.sh
+bash scripts/run_gdsd_llada_gsm8k.sh
+bash scripts/run_gdsd_llada_math.sh
+bash scripts/run_spg_llada_gsm8k.sh
+bash scripts/run_espo_llada_math.sh
 ```
 
 The scripts use public model identifiers by default. To use a local model copy,
 set `MODEL_NAME_OR_PATH`:
 
 ```bash
-MODEL_NAME_OR_PATH=/path/to/model bash scripts/run_gdsd_llada_sudoku.sh 1
+MODEL_NAME_OR_PATH=/path/to/model bash scripts/run_gdsd_llada_sudoku.sh
 ```
 
 Weights & Biases logging is disabled in `scripts/train_gdsd.yaml` by default.
@@ -84,13 +84,13 @@ Run from the `eval/` directory:
 
 ```bash
 cd eval
-DATASET=countdown MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct bash run_eval.sh 1
+DATASET=countdown MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct bash run_eval.sh
 ```
 
 Set `CHECKPOINT_PATH` to evaluate a trained LoRA checkpoint:
 
 ```bash
-CHECKPOINT_PATH=../outputs/sudoku_gdsd_demo/checkpoints/checkpoint-500 DATASET=sudoku bash run_eval.sh 1
+CHECKPOINT_PATH=../outputs/sudoku_gdsd_demo/checkpoints/checkpoint-500 DATASET=sudoku bash run_eval.sh
 ```
 
 For GSM8K/Math runs using the bundled lm-eval-compatible path:
