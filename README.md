@@ -103,3 +103,14 @@ MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct bash lmeval_batch_math.sh
 
 
 ## Checkpoints
+
+We release our checkpoints for the benefit of the community. 
+
+| Algorithm | Task   | Base model | Link                                                             |
+|-----------|--------|------------|------------------------------------------------------------------|
+| GDSD-TLC  | Sudoku | Dream-7B   | https://huggingface.co/diffusion-reasoning/gdsd_sudoku_dream     |
+| GDSD-TLC  | Countdown | Dream-7B   | https://huggingface.co/diffusion-reasoning/gdsd_countdown_dream     |
+| GDSD-TLC  | Sudoku | LLaDA-8B   | https://huggingface.co/diffusion-reasoning/gdsd_sudoku_llada     |
+| GDSD-TLC  | Countdown | LLaDA-8B   | https://huggingface.co/diffusion-reasoning/gdsd_countdown_llada     |
+| GDSD-TLC  | Code | LLaDA-8B   | https://huggingface.co/diffusion-reasoning/gdsd_code_llada     |
+
