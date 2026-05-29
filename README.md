@@ -1,5 +1,7 @@
 # GDSD: Reinforcement Learning as Guided Denoiser Self-Distillation for Diffusion Language Models
 
+This is the official implementation of [GDSD](https://arxiv.org/abs/2605.29398)
+
 The main entry point is `gdsd/gdsd_train.py`; it supports GDSD, GDSD-TLC, ESPO, and SPG through `--rl_loss_type`.
 
 ## Layout
@@ -114,3 +116,22 @@ We release our checkpoints for the benefit of the community.
 | GDSD-TLC  | Countdown | LLaDA-8B   | https://huggingface.co/diffusion-reasoning/gdsd_countdown_llada     |
 | GDSD-TLC  | Code | LLaDA-8B   | https://huggingface.co/diffusion-reasoning/gdsd_code_llada     |
 
+## Citation 
+
+If you find GDSD helpful, please consider citing us:)
+
+```
+@misc{tang2026gdsdreinforcementlearningguided,
+      title={GDSD: Reinforcement Learning as Guided Denoiser Self-Distillation for Diffusion Language Models}, 
+      author={Xiaohang Tang and Keyue Jiang and Che Liu and Qifang Zhao and Xiaoxiao Xu and Sangwoong Yoon and Ilija Bogunovic},
+      year={2026},
+      eprint={2605.29398},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.29398}, 
+}
+```
+
+## Acknowledgements.
+
+The code is developed based on [ESPO](https://github.com/ML-GSAI/ESPO) and [SPG](https://github.com/facebookresearch/SPG). We sincerely appreciate their contribution to the community. 
