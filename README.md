@@ -1,6 +1,31 @@
 # GDSD: Reinforcement Learning as Guided Denoiser Self-Distillation for Diffusion Language Models
 
-This is the official implementation of [GDSD](https://arxiv.org/abs/2605.29398).
+This is the official implementation of [GDSD](https://arxiv.org/abs/2605.29398), a novel post-training method for masked diffusion language models that converts RL into an equivalent self-distillation procedure without any likelihood approximation.
+
+<p align="center">
+  <img src="figures/flow_gdsd.png" alt="GDSD workflow: sampling and guided denoiser self-distillation" width="100%">
+</p>
+
+Unlike previous methods that rely on the ELBO terms $L_\theta(x_0)$ and $L_{\mathrm{old}}(x_0)$ to estimate the likelihood ratio in RL, our method directly matches denoiser logits for denoiser self-distillation, making the procedure likelihood-free and avoiding potential bias.
+
+### Training rewards
+GDSD demonstrates more stable training than ELBO-based methods.
+<table align="center">
+  <tr>
+    <td align="center" width="33%"><img src="figures/gsm8k_reward.png" alt="GSM8K reward curves" width="100%"><br><sub>GSM8K</sub></td>
+    <td align="center" width="33%"><img src="figures/ctd_reward.png" alt="Countdown reward curves" width="100%"><br><sub>Countdown</sub></td>
+    <td align="center" width="33%"><img src="figures/code_reward.png" alt="Coding reward curves" width="100%"><br><sub>Coding</sub></td>
+  </tr>
+</table>
+
+### Accuracies
+GDSD consistently improves performance compared with ELBO-based methods.
+<table align="center">
+  <tr>
+    <td align="center" width="49%"><img src="figures/methods_histogram_dream_subplots_best.png" alt="Method comparison on Dream-7B" width="100%"><br><sub>Dream-7B</sub></td>
+    <td align="center" width="49%"><img src="figures/methods_histogram_llada_subplots_best.png" alt="Method comparison on LLaDA-8B" width="100%"><br><sub>LLaDA-8B</sub></td>
+  </tr>
+</table>
 
 The main entry point is `gdsd/gdsd_train.py`; it supports GDSD, GDSD-TLC, ESPO, and SPG through `--rl_loss_type`.
 
