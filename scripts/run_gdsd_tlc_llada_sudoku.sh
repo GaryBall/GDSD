@@ -17,5 +17,5 @@ accelerate launch \
   --dataset_name "${DATASET}" \
   --model_name_or_path "${MODEL_NAME_OR_PATH}" \
   --run_name "${RUN_NAME}" \
-  --rl_loss_type gdsd \
+  --rl_loss_type gdsd_tlc \
   --output_dir "${OUTPUT_ROOT}/${RUN_NAME}/checkpoints"
