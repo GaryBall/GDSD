@@ -107,7 +107,7 @@ variables outside this archive.
 
 ## Evaluation Examples
 
-Run from the `eval/` directory:
+For Sudoku/Countdown evaluation, you can run from the `eval/` directory:
 
 ```bash
 cd eval
@@ -120,12 +120,13 @@ Set `CHECKPOINT_PATH` to evaluate a trained LoRA checkpoint:
 CHECKPOINT_PATH=../outputs/sudoku_gdsd_demo/checkpoints/checkpoint-500 DATASET=sudoku bash run_eval.sh
 ```
 
-For GSM8K/Math runs using the bundled lm-eval-compatible path:
+For GSM8K/Math/Coding runs using the bundled lm-eval-compatible path:
 
 ```bash
 cd math_eval/llada_eval/lmeval_scripts
 MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct bash lmeval_batch_gsm8k.sh
 MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct bash lmeval_batch_math.sh
+MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct bash lmeval_batch_code.sh
 ```
 
 
