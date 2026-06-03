@@ -36,7 +36,7 @@ accelerate launch \
   --generation_batch_size "${GEN_BS}" \
   --num_generations "${NUM_GEN}" \
   --num_mc "${SAMPLE_STEPS}" \
-  --rl_loss_type gdsd \
+  --rl_loss_type gdsd_tlc \
   --max_completion_length "${MAX_COMPLETION_LENGTH}" \
   --max_prompt_length 400 \
   --beta "${BETA_KL_DIV}" \
