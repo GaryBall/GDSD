@@ -452,12 +452,13 @@ class GDSDTLCTrainer(GRPOTrainer):
         logits = self.get_logits(model, perturbed_seq)
         logits_kept = logits[:, -logits_to_keep:]
 
-        # Apply logit centralization
-        logits_kept = logits_kept - logits_kept.mean(dim=-1, keepdim=True).detach()
+        # Token-level logit centralization (TLC, Eq. 8):
+        # log p̄(y) = log p(y) − mean_v log p(v), read out via gather
+        # (cross_entropy would re-normalize and cancel the centering).
+        logp = F.log_softmax(logits_kept.float(), dim=-1)
+        logp_bar = logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1) - logp.mean(dim=-1)
 
-        loss[mask_index_kept] = F.cross_entropy(
-            logits_kept[mask_index_kept], targets_kept[mask_index_kept], reduction="none"
-        ).to(loss.dtype) / p_mask_kept[mask_index_kept]
+        loss[mask_index_kept] = -logp_bar[mask_index_kept] / p_mask_kept[mask_index_kept]
 
         # reduce variance (must stay on 2D [N, logits_to_keep] before view/permute below)
         coupled_perturbed_seq = expanded_input.clone()
@@ -467,11 +468,10 @@ class GDSDTLCTrainer(GRPOTrainer):
         coupled_logits = self.get_logits(model,coupled_perturbed_seq)
         
         coupled_logits_kept = coupled_logits[:, -logits_to_keep:]  # [num_iterations * batch_size, logits_to_keep, vocab_size]
-        coupled_logits_kept = coupled_logits_kept - coupled_logits_kept.mean(dim=-1, keepdim=True).detach()
-        
-        loss[~mask_index_kept] = F.cross_entropy(
-            coupled_logits_kept[~mask_index_kept], targets_kept[~mask_index_kept], reduction="none"
-        ) / (logits_to_keep /(logits_to_keep + 1 )  - p_mask_kept[~mask_index_kept])
+        coupled_logp = F.log_softmax(coupled_logits_kept.float(), dim=-1)
+        coupled_logp_bar = coupled_logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1) - coupled_logp.mean(dim=-1)
+
+        loss[~mask_index_kept] = -coupled_logp_bar[~mask_index_kept] / (logits_to_keep /(logits_to_keep + 1 )  - p_mask_kept[~mask_index_kept])
 
         loss = -loss.view(num_iterations, num_mc, batch_size, logits_to_keep).permute(2, 1, 0, 3)
         loss /= 2
