@@ -454,7 +454,6 @@ class GDSDTLCTrainer(GRPOTrainer):
 
         # Token-level logit centralization (TLC, Eq. 8):
         # log p̄(y) = log p(y) − mean_v log p(v), read out via gather
-        # (cross_entropy would re-normalize and cancel the centering).
         logp = F.log_softmax(logits_kept.float(), dim=-1)
         logp_bar = logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1) - logp.mean(dim=-1)
 
