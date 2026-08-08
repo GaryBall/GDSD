@@ -54,6 +54,9 @@ generation_temperature: 1.0
 num_mc: 1
 reduce_var: false
 psi: 1.0
+# GDSD-TLC only: size of the top-k head used for the centering constant.
+# Set >= vocab_size to recover the exact full-vocabulary centering of Eq. 8.
+tlc_topk: 64
 
 report_to:
 - none
