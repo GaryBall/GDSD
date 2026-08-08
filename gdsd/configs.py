@@ -30,7 +30,31 @@ class GRPOConfig(trl.GRPOConfig):
         default="gdsd",
         metadata={"help": "Trainer objective: 'gdsd', 'gdsd_tlc', 'espo', or 'spg'."},
     )
-    psi: float = field(default=1.0, metadata={"help": "Scale coefficient for GDSD guidance."})
+    psi: float = field(
+        default=0.04,
+        metadata={
+            "help": (
+                "Advantage-guidance strength of the GDSD regression target. The loss regresses the "
+                "PER-TOKEN log-ratio (log p_theta - log p_old) / L onto psi * A, so this psi equals "
+                "the paper's sequence-level psi divided by the completion length L "
+                "(psi_paper = 10, L = 256 -> psi = 0.04). Recommended range: 0.01-0.1."
+            )
+        },
+    )
+    tlc_topk: int = field(
+        default=64,
+        metadata={
+            "help": (
+                "GDSD-TLC centering constant c = mean log-prob of the top-k vocabulary entries, "
+                "instead of the full-vocabulary mean of Eq. 8. Since c^(k) = mean_topk(z) - "
+                "logsumexp(z), this reduces to log p_bar(y) = z_y - mean_topk(z) and c^(k) stays "
+                "continuous in the logits. Restricting c to the head keeps it O(1) rather than "
+                "O(-log V) and makes it far less sensitive to the unconstrained logit tail, whose "
+                "drift is amplified by the completion length L in the sequence-level log-ratio. "
+                "Set <=0 or >= vocab_size to recover the exact full-vocabulary Eq. 8."
+            )
+        },
+    )
 
     # SPG-specific options. These defaults match the public SPG-style launch recipe.
     block_length: int = field(default=32, metadata={"help": "Diffusion block length for SPG."})
