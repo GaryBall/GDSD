@@ -10,7 +10,7 @@ from gdsd.configs import GRPOConfig, GRPOScriptArguments
 from gdsd.data_utils import get_datasets
 from gdsd.rewards import get_reward_funcs
 from gdsd.trainers.espo_trainer import ESPOTrainer
-from gdsd.trainers.gdsd_trainer_batchll import GDSDTrainer
+from gdsd.trainers.gdsd_trainer import GDSDTrainer
 from gdsd.trainers.gdsd_trainer_tlc import GDSDTLCTrainer
 from gdsd.trainers.spg_trainer import SPGTrainer
 from gdsd.utils import get_model, get_tokenizer
