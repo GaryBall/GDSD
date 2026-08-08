@@ -1,4 +1,6 @@
 import math
+import os
+import json
 import transformers
 from packaging import version
 import torch
@@ -53,7 +55,15 @@ def split_tensor_dict(
     return chunks
 
 
-def forward_process(batch, prompt_index, mask_id, seed=None):
+def forward_process(
+    batch,
+    prompt_index,
+    mask_id,
+    seed=None,
+    remasking="random",
+    block_length=None,
+    rollout_scores=None,
+):
     set_seed(seed.item())
 
     b, l = batch.shape
@@ -64,10 +74,48 @@ def forward_process(batch, prompt_index, mask_id, seed=None):
     x = x % (target_len + 1)
     assert x.min() >= 0 and x.max() <= target_len
 
-    indices = torch.arange(target_len, device=batch.device).repeat(b, 1)
-    is_mask = indices < x.unsqueeze(1)
+    is_mask = torch.zeros(b, target_len, dtype=torch.bool, device=batch.device)
+    effective_block_length = block_length or target_len
+    use_blockwise = effective_block_length < target_len
+
     for i in range(b):
-        is_mask[i] = is_mask[i][torch.randperm(target_len)]
+        mask_count = x[i].item()
+        if mask_count == 0:
+            continue
+
+        if use_blockwise:
+            full_blocks = mask_count // effective_block_length
+            partial_count = mask_count % effective_block_length
+            suffix_start = target_len - full_blocks * effective_block_length
+            if full_blocks > 0:
+                is_mask[i, suffix_start:] = True
+
+            if partial_count > 0:
+                partial_end = suffix_start
+                partial_start = max(0, partial_end - effective_block_length)
+                candidates = torch.arange(partial_start, partial_end, device=batch.device)
+                if remasking == "low_confidence" and rollout_scores is not None:
+                    scores = rollout_scores[i, candidates]
+                    _, order = torch.topk(-scores, k=partial_count)
+                    chosen = candidates[order]
+                elif remasking == "random":
+                    chosen = candidates[torch.randperm(candidates.numel(), device=batch.device)[:partial_count]]
+                elif remasking == "low_confidence":
+                    raise ValueError("low_confidence remasking requires rollout_scores, but rollout_scores is None.")
+                else:
+                    raise NotImplementedError(remasking)
+                is_mask[i, chosen] = True
+        elif remasking == "low_confidence" and rollout_scores is not None:
+            scores = rollout_scores[i, :target_len]
+            _, chosen = torch.topk(-scores, k=mask_count)
+            is_mask[i, chosen] = True
+        elif remasking == "random":
+            chosen = torch.randperm(target_len, device=batch.device)[:mask_count]
+            is_mask[i, chosen] = True
+        elif remasking == "low_confidence":
+            raise ValueError("low_confidence remasking requires rollout_scores, but rollout_scores is None.")
+        else:
+            raise NotImplementedError(remasking)
 
     is_mask = torch.cat((torch.zeros(b, prompt_index.sum(), dtype=torch.bool, device=batch.device), is_mask), dim=1)
     noisy_batch = torch.where(is_mask, mask_id, batch)
@@ -173,7 +221,14 @@ class GDSDTLCTrainer(GRPOTrainer):
         input_ids = input_ids.unsqueeze(0)
 
         # [batch_size, num_mc, 1]
-        per_token_logps = self._get_denoise_probs(model, input_ids, logits_to_keep,this_itr_mask_seed,num_mc = self.num_mc)  
+        per_token_logps, per_token_logps_plain = self._get_denoise_probs(
+            model,
+            input_ids,
+            logits_to_keep,
+            this_itr_mask_seed,
+            num_mc=self.num_mc,
+            rollout_scores=inputs.get("rollout_scores"),
+        )
 
         # Compute the loss
         advantages = inputs["advantages"]
@@ -188,14 +243,21 @@ class GDSDTLCTrainer(GRPOTrainer):
         # per_token_loss2 = coef_2 * advantages.view(-1, 1)
         # loss = -torch.min(per_token_loss1, per_token_loss2).sum()/ batch_size
         
-        logits_diff = (per_token_logps - old_per_token_logps).clamp(math.log(1 - self.epsilon_low), math.log(1 + self.epsilon_high))
+        delta_raw = per_token_logps - old_per_token_logps
+        clamp_lo = math.log(1 - self.epsilon_low)
+        clamp_hi = math.log(1 + self.epsilon_high)
+        logits_diff = delta_raw.clamp(clamp_lo, clamp_hi)
         loss = ((logits_diff / logits_to_keep - self.psi * advantages.view(-1, 1, 1)) ** 2).sum() / batch_size
 
 
-        # Compute the KL divergence between the model and the reference model
+        # Compute the KL divergence between the model and the reference model.
+        # NOTE: the KL is computed on the NORMALIZED log-likelihood, not on the TLC-centered one.
+        # log p̄ is unnormalized, so its scale is dominated by the (detached) vocab-mean term; that
+        # term does not cancel between two different models and gets amplified by L^2 inside the
+        # squared k2 estimator, which is what made this term explode (KL ~ 1e6) and collapse runs.
         if self.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"][:, :, this_itr_idx].unsqueeze(-1)  # [batch_size, num_mc, 1]
-            kl = compute_approx_kl(per_token_logps, ref_per_token_logps, "k2")
+            kl = compute_approx_kl(per_token_logps_plain, ref_per_token_logps, "k2")
             mean_kl = kl.sum() / (batch_size * self.num_mc * logits_to_keep)
             loss += self.beta * mean_kl
 
@@ -207,8 +269,46 @@ class GDSDTLCTrainer(GRPOTrainer):
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
         self._metrics[mode]["entropy"].append(
-            self.accelerator.gather_for_metrics(-per_token_logps.sum()/ (batch_size * self.num_mc * logits_to_keep)).mean().item()
+            self.accelerator.gather_for_metrics(-per_token_logps_plain.sum()/ (batch_size * self.num_mc * logits_to_keep)).mean().item()
         )
+
+        # ---- training-stability / gradient-noise diagnostics ----
+        # diag/logp_*        : scale of the sequence log-likelihood estimate. Under TLC this is
+        #                     UNNORMALIZED (log p̄ = log p - mean_v log p), so a drifting vocab-mean
+        #                     shows up here first and is what the k2 KL term amplifies quadratically.
+        # diag/logp_mc_std   : Monte-Carlo noise of the ELBO estimate across num_mc mask samples.
+        # diag/clamp_sat_ratio: fraction of samples whose log-ratio hit the trust region, i.e. whose
+        #                     MSE gradient is exactly zero (clamp has no gradient outside its bounds).
+        # diag/gradscale_*   : per-sample gradient scale of the MSE term, dL/d(log p) = 2*residual/L.
+        # diag/grad_snr_proxy: |E[g]| / std(g) over the batch -> gradient signal-to-noise.
+        with torch.no_grad():
+            target = self.psi * advantages.view(-1, 1, 1)
+            residual = logits_diff / logits_to_keep - target
+            grad_scale = (2.0 * residual / logits_to_keep).reshape(-1)
+            saturated = ((delta_raw <= clamp_lo) | (delta_raw >= clamp_hi)).float()
+            diag = self._metrics[mode]
+
+            def _log_diag(name, value, reduce="mean"):
+                gathered = self.accelerator.gather_for_metrics(value.detach()).float()
+                diag[name].append((gathered.max() if reduce == "max" else gathered.mean()).item())
+
+            _log_diag("diag/logp_mean", per_token_logps.mean())
+            _log_diag("diag/logp_absmax", per_token_logps.abs().max(), reduce="max")
+            _log_diag("diag/logp_plain_mean", per_token_logps_plain.mean())
+            if self.num_mc > 1:
+                _log_diag("diag/logp_mc_std", per_token_logps.std(dim=1).mean())
+            _log_diag("diag/logratio_absmean", delta_raw.abs().mean())
+            _log_diag("diag/logratio_absmax", delta_raw.abs().max(), reduce="max")
+            _log_diag("diag/clamp_sat_ratio", saturated.mean())
+            _log_diag("diag/target_absmean", target.abs().mean())
+            _log_diag("diag/residual_absmean", residual.abs().mean())
+            _log_diag("diag/gradscale_absmean", grad_scale.abs().mean())
+            if grad_scale.numel() > 1:
+                grad_std = grad_scale.std()
+                _log_diag("diag/gradscale_std", grad_std)
+                _log_diag("diag/grad_snr_proxy", grad_scale.mean().abs() / (grad_std + 1e-12))
+            if self.beta != 0.0:
+                _log_diag("diag/kl_absmax", kl.abs().max(), reduce="max")
         # Compute the clipped probability ratios
         # is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
         # is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
@@ -276,6 +376,7 @@ class GDSDTLCTrainer(GRPOTrainer):
         cfg_scale=0.0,
         remasking="low_confidence",
         mask_id=126336,
+        return_transition_scores=False,
     ):
         """generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)"""
         with torch.amp.autocast("cuda", enabled=True):
@@ -283,6 +384,7 @@ class GDSDTLCTrainer(GRPOTrainer):
             dtype = model.dtype
             x = torch.full((bs, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
             x[:, : prompt.shape[1]] = prompt.clone()
+            transition_scores = torch.full(x.shape, -torch.inf, dtype=torch.float32, device=model.device)
 
             # extend attention mask
             if attention_mask is not None:
@@ -356,7 +458,10 @@ class GDSDTLCTrainer(GRPOTrainer):
                                     transfer_index[j, select_index] = True
 
                             x[transfer_index] = x0[transfer_index]
+                            transition_scores[transfer_index] = x0_p[transfer_index].to(torch.float32)
 
+            if return_transition_scores:
+                return x, transition_scores
             return x
 
     def get_logits(self, model, batch):
@@ -390,7 +495,7 @@ class GDSDTLCTrainer(GRPOTrainer):
                 f"expected {expected_masked_tokens.item()}, got {actual_masked_tokens.item()}."
             )
 
-    def _build_elbo_forward_batch(self, input_ids, logits_to_keep, mask_seeds):
+    def _build_elbo_forward_batch(self, input_ids, logits_to_keep, mask_seeds, rollout_scores=None):
         num_iterations, batch_size, seq_len = input_ids.size()
         device = input_ids.device
 
@@ -417,6 +522,9 @@ class GDSDTLCTrainer(GRPOTrainer):
                     prompt_index,
                     self.processing_class.mask_token_id,
                     seed=mask_seeds[iter_idx, mc_idx],
+                    remasking=self.args.remasking,
+                    block_length=self.args.block_length,
+                    rollout_scores=rollout_scores,
                 )
                 all_perturbed_seqs.append(perturbed_seq)
                 all_expanded_inputs.append(expanded_input)
@@ -428,6 +536,17 @@ class GDSDTLCTrainer(GRPOTrainer):
         self._validate_masked_batch(perturbed_seq, p_mask, prompt_length, logits_to_keep)
 
         return perturbed_seq, expanded_input, p_mask, num_iterations, num_mc, batch_size
+
+    def _tlc_center(self, logp: torch.Tensor) -> torch.Tensor:
+        """TLC centering constant c for each position, shape [..., ] (vocab dim reduced).
+
+        c = mean of the top-k log-probs, with k = args.tlc_topk. Falls back to the exact
+        full-vocabulary mean of paper Eq. 8 when k <= 0 or k >= vocab_size.
+        """
+        topk = int(getattr(self.args, "tlc_topk", 0) or 0)
+        if topk <= 0 or topk >= logp.size(-1):
+            return logp.mean(dim=-1)
+        return logp.topk(topk, dim=-1).values.mean(dim=-1)
 
     def _compute_denoise_probs_from_masked_batch(
         self,
@@ -447,17 +566,26 @@ class GDSDTLCTrainer(GRPOTrainer):
         p_mask_kept = p_mask[:, -logits_to_keep:]
 
         loss = torch.zeros(perturbed_seq.size(0), logits_to_keep, device=device, dtype=torch.float32)
+        loss_plain = torch.zeros_like(loss)
         mask_index_kept = (perturbed_seq == self.processing_class.mask_token_id)[:, -logits_to_keep:]
 
         logits = self.get_logits(model, perturbed_seq)
         logits_kept = logits[:, -logits_to_keep:]
 
         # Token-level logit centralization (TLC, Eq. 8):
-        # log p̄(y) = log p(y) − mean_v log p(v), read out via gather
+        # log p̄(y) = log p(y) − c, read out via gather (cross_entropy would re-normalize
+        # and cancel the centering). c is the mean log-prob over the top-k vocabulary
+        # entries (args.tlc_topk); k >= V recovers the exact full-vocabulary Eq. 8.
+        # Restricting c to the head keeps it O(1) instead of O(-log V) and makes it far less
+        # sensitive to the unconstrained logit tail, which is what drives the drift that
+        # swamps the trust region once multiplied by the completion length.
         logp = F.log_softmax(logits_kept.float(), dim=-1)
-        logp_bar = logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1) - logp.mean(dim=-1)
+        logp_tok = logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1)
+        logp_bar = logp_tok - self._tlc_center(logp).detach()
 
-        loss[mask_index_kept] = -logp_bar[mask_index_kept] / p_mask_kept[mask_index_kept]
+        w_mask = p_mask_kept[mask_index_kept]
+        loss[mask_index_kept] = -logp_bar[mask_index_kept] / w_mask
+        loss_plain[mask_index_kept] = -logp_tok[mask_index_kept] / w_mask
 
         # reduce variance (must stay on 2D [N, logits_to_keep] before view/permute below)
         coupled_perturbed_seq = expanded_input.clone()
@@ -468,14 +596,19 @@ class GDSDTLCTrainer(GRPOTrainer):
         
         coupled_logits_kept = coupled_logits[:, -logits_to_keep:]  # [num_iterations * batch_size, logits_to_keep, vocab_size]
         coupled_logp = F.log_softmax(coupled_logits_kept.float(), dim=-1)
-        coupled_logp_bar = coupled_logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1) - coupled_logp.mean(dim=-1)
+        coupled_logp_tok = coupled_logp.gather(-1, targets_kept.unsqueeze(-1)).squeeze(-1)
+        coupled_logp_bar = coupled_logp_tok - self._tlc_center(coupled_logp).detach()
 
-        loss[~mask_index_kept] = -coupled_logp_bar[~mask_index_kept] / (logits_to_keep /(logits_to_keep + 1 )  - p_mask_kept[~mask_index_kept])
+        w_coupled = logits_to_keep /(logits_to_keep + 1 )  - p_mask_kept[~mask_index_kept]
+        loss[~mask_index_kept] = -coupled_logp_bar[~mask_index_kept] / w_coupled
+        loss_plain[~mask_index_kept] = -coupled_logp_tok[~mask_index_kept] / w_coupled
 
-        loss = -loss.view(num_iterations, num_mc, batch_size, logits_to_keep).permute(2, 1, 0, 3)
-        loss /= 2
+        def _reduce(elbo_loss):
+            elbo_loss = -elbo_loss.view(num_iterations, num_mc, batch_size, logits_to_keep).permute(2, 1, 0, 3)
+            return (elbo_loss / 2).sum(dim=-1)
 
-        return loss.sum(dim=-1)
+        # (TLC estimate for the regression term, normalized estimate for the KL term)
+        return _reduce(loss), _reduce(loss_plain)
 
     def _get_denoise_probs(
         self,
@@ -485,6 +618,7 @@ class GDSDTLCTrainer(GRPOTrainer):
         mask_seeds,
         num_mc=1,
         reduce_var=True,
+        rollout_scores=None,
     ):
         """
         Denoise probabilities with a single batched model forward.
@@ -505,7 +639,7 @@ class GDSDTLCTrainer(GRPOTrainer):
             num_iterations,
             num_mc,
             batch_size,
-        ) = self._build_elbo_forward_batch(input_ids, logits_to_keep, mask_seeds)
+        ) = self._build_elbo_forward_batch(input_ids, logits_to_keep, mask_seeds, rollout_scores=rollout_scores)
 
         return self._compute_denoise_probs_from_masked_batch(
             model,
@@ -521,20 +655,47 @@ class GDSDTLCTrainer(GRPOTrainer):
 
 
 
-    def _get_denoise_probs_by_chunk(self, model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds, device, reduce_var=True):
+    def _get_denoise_probs_by_chunk(
+        self,
+        model,
+        prompt_completion_ids_expanded,
+        logits_to_keep,
+        mask_seeds,
+        device,
+        reduce_var=True,
+        rollout_scores=None,
+    ):
         elbos = torch.zeros((prompt_completion_ids_expanded.shape[1], self.num_mc, self.num_iterations), device=device)
+        elbos_plain = torch.zeros_like(elbos)
         local_batch_size = prompt_completion_ids_expanded.shape[1] // self.args.gradient_accumulation_steps
+        try:
+            iter_chunk_size = int(os.environ.get("GDSD_ELBO_ITER_CHUNK_SIZE", self.num_iterations))
+        except ValueError:
+            iter_chunk_size = self.num_iterations
+        iter_chunk_size = max(1, min(iter_chunk_size, self.num_iterations))
         for i in range(self.args.gradient_accumulation_steps):
-            for j in range(self.num_iterations):
-                elbos[i*local_batch_size:(i+1)*local_batch_size, :, j] = self._get_denoise_probs(
+            batch_start = i * local_batch_size
+            batch_end = (i + 1) * local_batch_size
+            rollout_scores_chunk = (
+                rollout_scores[batch_start:batch_end]
+                if rollout_scores is not None
+                else None
+            )
+            for iter_start in range(0, self.num_iterations, iter_chunk_size):
+                iter_end = min(iter_start + iter_chunk_size, self.num_iterations)
+                chunk_elbo, chunk_elbo_plain = self._get_denoise_probs(
                     model,
-                    prompt_completion_ids_expanded[j:j+1, i*local_batch_size:(i+1)*local_batch_size, :],
+                    prompt_completion_ids_expanded[iter_start:iter_end, batch_start:batch_end, :],
                     logits_to_keep,
-                    mask_seeds[i][j:j+1], # [1, num_mc]
+                    mask_seeds[i][iter_start:iter_end],
                     num_mc=self.num_mc,
                     reduce_var=reduce_var,
-                )[:, :, 0]  # [batch_size, num_mc]
-        return elbos  # [batch_size, num_mc, num_iterations]
+                    rollout_scores=rollout_scores_chunk,
+                )
+                elbos[batch_start:batch_end, :, iter_start:iter_end] = chunk_elbo
+                elbos_plain[batch_start:batch_end, :, iter_start:iter_end] = chunk_elbo_plain
+        # each: [batch_size, num_mc, num_iterations]
+        return elbos, elbos_plain
 
     def _prepare_inputs(
         self, accumulated_local_batch: dict[str, Union[torch.Tensor, Any]]
@@ -552,7 +713,7 @@ class GDSDTLCTrainer(GRPOTrainer):
             self._step += 1
         else:
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            inputs = self._generate_and_score_completions(accumulated_local_batch)
+            inputs = self._generate_and_score_completions(inputs)
         return inputs
 
     def _generate_and_score_completions(
@@ -582,10 +743,14 @@ class GDSDTLCTrainer(GRPOTrainer):
         gen_length = self.args.max_completion_length
         steps = self.args.diffusion_steps
         temperature = self.args.generation_temperature
+        block_length = self.args.block_length
+        remasking = self.args.remasking
+        cfg_scale = self.args.cfg_scale
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generation_batch_size = self.args.generation_batch_size
             prompt_completion_ids_all = []
+            transition_scores_all = []
             # torch.cuda.empty_cache()
             # Process in batches
             for i in range(0, prompt_ids.size(0), generation_batch_size):
@@ -593,16 +758,20 @@ class GDSDTLCTrainer(GRPOTrainer):
                 batch_prompt_ids = prompt_ids[i:end_idx]
                 batch_prompt_mask = prompt_mask[i:end_idx]
                 if "LLaDA" in self.model.config.name_or_path: 
-                    batch_prompt_completion_ids = self.generate(
-                    model=unwrapped_model,
-                    attention_mask=batch_prompt_mask,
-                    prompt=batch_prompt_ids,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=32,
-                    temperature=temperature,
+                    batch_prompt_completion_ids, batch_transition_scores = self.generate(
+                        model=unwrapped_model,
+                        attention_mask=batch_prompt_mask,
+                        prompt=batch_prompt_ids,
+                        steps=steps,
+                        gen_length=gen_length,
+                        block_length=block_length,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        remasking=remasking,
+                        return_transition_scores=True,
                     )
                     prompt_completion_ids_all.append(batch_prompt_completion_ids)
+                    transition_scores_all.append(batch_transition_scores)
 
                 else:
                     batch_prompt_completion_ids = unwrapped_model.diffusion_generate(
@@ -620,16 +789,27 @@ class GDSDTLCTrainer(GRPOTrainer):
                     )
                 # import pdb; pdb.set_trace();
                     prompt_completion_ids_all.append(batch_prompt_completion_ids.sequences)
+                    transition_scores_all.append(None)
 
                 # del batch_prompt_ids, batch_prompt_mask, batch_prompt_completion_ids
                 # torch.cuda.empty_cache()
 
             prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
+            transition_scores = (
+                torch.cat(transition_scores_all, dim=0)
+                if transition_scores_all and transition_scores_all[0] is not None
+                else None
+            )
 
         # Compute prompt length and extract completion ids
         prompt_length = prompt_ids.size(1)
         prompt_ids = prompt_completion_ids[:, :prompt_length]  # [accum_batch_size, prompt_length]
         completion_ids = prompt_completion_ids[:, prompt_length:]
+        rollout_scores = (
+            transition_scores[:, prompt_length:]
+            if transition_scores is not None
+            else None
+        )
 
         # Mask everything after the first EOS token
         # eos_token = '<|im_end|>'
@@ -652,8 +832,14 @@ class GDSDTLCTrainer(GRPOTrainer):
         with torch.no_grad():
             if self.num_iterations > 1:
                 # repeat prompt completion ids self.num_iterations times
-                old_per_token_logps = self._get_denoise_probs_by_chunk(
-                    self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds, device
+                # the regression term compares against the TLC-centered estimate
+                old_per_token_logps, _ = self._get_denoise_probs_by_chunk(
+                    self.model,
+                    prompt_completion_ids_expanded,
+                    logits_to_keep,
+                    mask_seeds,
+                    device,
+                    rollout_scores=rollout_scores,
                 )
                 all_old_per_token_logps = old_per_token_logps
             else:
@@ -662,14 +848,25 @@ class GDSDTLCTrainer(GRPOTrainer):
             if self.beta == 0.0:
                 ref_per_token_logps = None
             else:
+                # the KL term uses the NORMALIZED estimate (see compute_loss)
                 if self.ref_model is not None:
-                    ref_per_token_logps = self._get_denoise_probs_by_chunk(
-                        self.ref_model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds, device
+                    _, ref_per_token_logps = self._get_denoise_probs_by_chunk(
+                        self.ref_model,
+                        prompt_completion_ids_expanded,
+                        logits_to_keep,
+                        mask_seeds,
+                        device,
+                        rollout_scores=rollout_scores,
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps = self._get_denoise_probs_by_chunk(
-                            self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds, device
+                        _, ref_per_token_logps = self._get_denoise_probs_by_chunk(
+                            self.model,
+                            prompt_completion_ids_expanded,
+                            logits_to_keep,
+                            mask_seeds,
+                            device,
+                            rollout_scores=rollout_scores,
                         )
                 all_ref_per_token_logps = ref_per_token_logps
 
@@ -768,6 +965,52 @@ class GDSDTLCTrainer(GRPOTrainer):
         self._metrics[mode]["completion_length"].append(completion_length)
         self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
 
+        # ---- same-prompt (intra-group) diversity diagnostics ----
+        # These fire BEFORE reward_std collapses, so they are the early-warning signal for
+        # mode collapse. Interpretation for a group of G = num_generations completions:
+        #   token_agreement    1.0 == every sample in the group is token-identical (collapsed)
+        #   unique_ratio       1/G == all duplicates, 1.0 == all distinct
+        #   group_entropy      0 == collapsed, log(G) == every sample unique
+        #   distinct_1         unique-token / total-token ratio inside the group (lexical variety)
+        #   unique_reward_ratio behavioural diversity in reward space
+        with torch.no_grad():
+            all_completion_ids = gather(completion_ids)
+            all_completion_mask = gather(completion_mask)
+            num_gen = self.num_generations
+            if num_gen > 1 and all_completion_ids.size(0) % num_gen == 0:
+                seq_len = all_completion_ids.size(1)
+                ids_g = all_completion_ids.view(-1, num_gen, seq_len)
+                msk_g = all_completion_mask.view(-1, num_gen, seq_len).bool()
+
+                # position-wise pairwise token agreement over valid positions
+                eq = ids_g.unsqueeze(2) == ids_g.unsqueeze(1)  # [P, G, G, L]
+                both = msk_g.unsqueeze(2) & msk_g.unsqueeze(1)
+                pair = (eq & both).sum(-1).float() / both.sum(-1).clamp(min=1).float()
+                offdiag = ~torch.eye(num_gen, dtype=torch.bool, device=pair.device)
+                token_agreement = pair[:, offdiag].mean()
+
+                ids_masked = torch.where(msk_g, ids_g, torch.full_like(ids_g, -1))
+                rewards_grouped_all = rewards.view(-1, num_gen)
+                uniq_ratios, entropies, distinct1, uniq_rewards = [], [], [], []
+                for p in range(ids_g.size(0)):
+                    _, counts = torch.unique(ids_masked[p], dim=0, return_counts=True)
+                    probs = counts.float() / num_gen
+                    uniq_ratios.append(counts.numel() / num_gen)
+                    entropies.append(float(-(probs * probs.log()).sum()))
+                    valid_tokens = ids_g[p][msk_g[p]]
+                    if valid_tokens.numel() > 0:
+                        distinct1.append(torch.unique(valid_tokens).numel() / valid_tokens.numel())
+                    uniq_rewards.append(torch.unique(rewards_grouped_all[p]).numel() / num_gen)
+
+                diag = self._metrics[mode]
+                diag["diag/div/token_agreement"].append(token_agreement.item())
+                diag["diag/div/unique_ratio"].append(float(np.mean(uniq_ratios)))
+                diag["diag/div/group_entropy"].append(float(np.mean(entropies)))
+                if distinct1:
+                    diag["diag/div/distinct_1"].append(float(np.mean(distinct1)))
+                diag["diag/div/unique_reward_ratio"].append(float(np.mean(uniq_rewards)))
+                diag["diag/div/len_std"].append(msk_g.sum(-1).float().std(dim=1).mean().item())
+
         # Calculate mean reward per function, but only for samples where the function was applied
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, nn.Module):
@@ -779,11 +1022,13 @@ class GDSDTLCTrainer(GRPOTrainer):
             self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
         self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
-        
-        self._textual_logs["prompt"].extend(gather_object(prompts_text))
-        self._textual_logs["completion"].extend(gather_object(completions_text))
-        for i, name in enumerate(self.reward_func_names):
-            self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+
+        should_log_completions = self.log_completions and (self.state.global_step - 1) % 100 == 0
+        if should_log_completions:
+            self._textual_logs["prompt"].extend(gather_object(prompts_text))
+            self._textual_logs["completion"].extend(gather_object(completions_text))
+            for i, name in enumerate(self.reward_func_names):
+                self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
 
         return {
             "prompt_ids": prompt_ids,
@@ -793,8 +1038,44 @@ class GDSDTLCTrainer(GRPOTrainer):
             "old_per_token_logps": all_old_per_token_logps,
             "ref_per_token_logps": all_ref_per_token_logps,
             "advantages": advantages,
+            "rollout_scores": rollout_scores,
             "mask_seeds": mask_seeds,  # Store all mask seeds for consistent mask patterns
         }
+
+    def _write_metrics_log(self, logs: dict[str, float], mode: str) -> None:
+        """Append the merged metrics (loss, reward, and every diag/* series) as one JSON line to
+        `<run dir>/diagnostics.jsonl`, so a run can be inspected/plotted offline without W&B.
+        The run dir is the parent of args.output_dir (which points at <LOGDIR>/<RUN_NAME>/checkpoints),
+        or GDSD_DIAG_DIR when that is set. Set GDSD_DIAG_LOG=0 to disable.
+        Failures never interrupt training."""
+        if os.environ.get("GDSD_DIAG_LOG", "1") == "0":
+            return
+        log_dir = os.environ.get("GDSD_DIAG_DIR") or ""
+        if not log_dir:
+            output_dir = getattr(self.args, "output_dir", None)
+            if not output_dir:
+                return
+            # keep diagnostics beside the checkpoints dir, i.e. in <LOGDIR>/<RUN_NAME>
+            log_dir = os.path.dirname(os.path.normpath(output_dir)) or output_dir
+
+        record = {"step": self.state.global_step, "mode": mode}
+        if getattr(self.args, "run_name", None):
+            record["run_name"] = self.args.run_name
+        for key, value in logs.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                value = None
+            record[key] = value
+
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "diagnostics.jsonl"), "a") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception as exc:  # diagnostics must never take down a training run
+            if not getattr(self, "_diag_log_failed", False):
+                warnings.warn(f"Could not write diagnostics log under {log_dir}: {exc}")
+                self._diag_log_failed = True
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "train" if self.model.training else "eval"
@@ -810,28 +1091,37 @@ class GDSDTLCTrainer(GRPOTrainer):
             Trainer.log(self, logs, start_time)
         else:  # transformers<=4.46
             Trainer.log(self, logs)
+        if self.accelerator.is_main_process:
+            self._write_metrics_log(logs, mode)
         self._metrics[mode].clear()
 
-        if self.accelerator.is_main_process and self.log_completions and (self.state.global_step-1) % 100 == 0: # save prompts and completions every 100 steps
-            if is_rich_available():
-                print_prompt_completions_sample(
-                    self._textual_logs["prompt"],
-                    self._textual_logs["completion"],
-                    self._textual_logs["rewards"],
-                    self.state.global_step,
-                    self.num_completions_to_print,
-                )
+        should_log_completions = self.log_completions and (self.state.global_step - 1) % 100 == 0
+        if should_log_completions:
+            if self.accelerator.is_main_process:
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        self._textual_logs["prompt"],
+                        self._textual_logs["completion"],
+                        self._textual_logs["rewards"],
+                        self.state.global_step,
+                        self.num_completions_to_print,
+                    )
 
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                import pandas as pd
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
 
-                table = {
-                    "step": [str(self.state.global_step)] * len(self._textual_logs["prompt"]),
-                    "prompt": self._textual_logs["prompt"],
-                    "completion": self._textual_logs["completion"],
-                    **self._textual_logs["rewards"],
-                }
-                df = pd.DataFrame(table)
-                if self.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                    table = {
+                        "step": [str(self.state.global_step)] * len(self._textual_logs["prompt"]),
+                        "prompt": self._textual_logs["prompt"],
+                        "completion": self._textual_logs["completion"],
+                        **self._textual_logs["rewards"],
+                    }
+                    df = pd.DataFrame(table)
+                    if self.wandb_log_unique_prompts:
+                        df = df.drop_duplicates(subset=["prompt"])
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
+            self._textual_logs["prompt"].clear()
+            self._textual_logs["completion"].clear()
+            for name in self.reward_func_names:
+                self._textual_logs["rewards"][name].clear()
