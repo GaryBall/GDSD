@@ -87,9 +87,12 @@ Run from the root of this archive.
 
 ```bash
 bash scripts/run_gdsd_llada_sudoku.sh
-bash scripts/run_gdsd_tlc_dream_countdown.sh
+bash scripts/run_gdsd_dream_sudoku.sh
+bash scripts/run_gdsd_dream_ctd.sh
+bash scripts/run_gdsd_llada_ctd.sh
 bash scripts/run_gdsd_llada_gsm8k.sh
 bash scripts/run_gdsd_llada_math.sh
+bash scripts/run_gdsd_llada_code.sh
 bash scripts/run_spg_llada_gsm8k.sh
 bash scripts/run_espo_llada_math.sh
 ```
